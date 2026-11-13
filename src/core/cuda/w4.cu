@@ -1,6 +1,11 @@
 #include <climits>
 #include "core/ggml_extensions.h"
 #include "runtime.h"
+#if defined(SD_CUDA_VENDOR_HIP)
+#include <hipblas/hipblas.h>
+#elif !defined(SD_CUDA_VENDOR_MUSA)
+#include <cublas_v2.h>
+#endif
 #ifdef SD_CUDA_W4_CUTLASS
 #include <cstdlib>
 #include <mutex>
@@ -86,10 +91,13 @@ namespace SD_CUDA_NAMESPACE {
 #define MUL_MAT_W4_SLOTS (4 * MUL_MAT_W4_GPS)
 #define MUL_MAT_W4_OUT (MUL_MAT_W4_BLOCK * 4)
 
-        static __global__ void __launch_bounds__(MUL_MAT_W4_BLOCK* MUL_MAT_W4_BLOCK) mul_mat_w4a4_convrot_dp4a(
+        static __device__ __forceinline__ void mul_mat_w4a4_convrot_dp4a_impl(
             const char* __restrict__ w,
             const char* __restrict__ x,
-            int* __restrict__ y,
+            const float* __restrict__ ws,
+            const float* __restrict__ act_scales,
+            const float* __restrict__ bias,
+            float* __restrict__ y,
             const uint32_t n,
             const uint32_t rows,
             const uint32_t packed_k) {
@@ -234,11 +242,28 @@ namespace SD_CUDA_NAMESPACE {
                     for (uint32_t j = 0; j < 4; ++j) {
                         const uint32_t oj = o_base + j * 16 + lx;
                         if (oj < n) {
-                            y[(size_t)rt * n + oj] = accv[t][j] - 8 * sumv[t];
+                            float value = (float)(accv[t][j] - 8 * sumv[t]) * act_scales[rt] * ws[oj];
+                            if (bias != nullptr) {
+                                value += bias[oj];
+                            }
+                            y[(size_t)rt * n + oj] = value;
                         }
                     }
                 }
             }
+        }
+
+        static __global__ void __launch_bounds__(MUL_MAT_W4_BLOCK* MUL_MAT_W4_BLOCK) mul_mat_w4a4_convrot_dp4a(
+            const char* __restrict__ w,
+            const char* __restrict__ x,
+            const float* __restrict__ ws,
+            const float* __restrict__ act_scales,
+            const float* __restrict__ bias,
+            float* __restrict__ y,
+            const uint32_t n,
+            const uint32_t rows,
+            const uint32_t packed_k) {
+            mul_mat_w4a4_convrot_dp4a_impl(w, x, ws, act_scales, bias, y, n, rows, packed_k);
         }
 
 #define MUL_MAT_W4A8_BLOCK 16
@@ -510,7 +535,7 @@ namespace SD_CUDA_NAMESPACE {
                     const int bwd = (kh & 2) ? w1c : w0c;
                     const int bsh = (kh & 1) * 16;
                     bfrag         = (lut[(bwd >> bsh) & 0xFF] & 0xFFFF) |
-                                    ((lut[(bwd >> (bsh + 8)) & 0xFF] & 0xFFFF) << 16);
+                            ((lut[(bwd >> (bsh + 8)) & 0xFF] & 0xFFFF) << 16);
 
                     s = scb * (s_chan * s_lut[sc & 0xFF]);
                 }
@@ -553,6 +578,183 @@ namespace SD_CUDA_NAMESPACE {
             }
         }
 #endif
+
+#if defined(SD_W4_WMMA_GFX11)
+        // W4A4 weights are packed signed nibbles. Unlike W4A8 the weight scale is
+        // constant per output column, so the int32 WMMA accumulator only needs a
+        // single dequantize pass in the epilogue.
+        // Stages weights (int2 per column per group) and activations (int4 per
+        // row per group) into double-buffered shared memory once per CTA, so
+        // the four waves do not each re-fetch the same global data, and the
+        // next stage streams in while the current one computes. The epilogue
+        // must keep the DP4A multiply order, see the comment there.
+        static __device__ __forceinline__ void mul_mat_w4a4_convrot_wmma(
+            const char* __restrict__ w,
+            const char* __restrict__ x,
+            const float* __restrict__ ws,
+            const float* __restrict__ act_scales,
+            const float* __restrict__ bias,
+            float* __restrict__ y,
+            const uint32_t n,
+            const uint32_t rows,
+            const uint32_t k,
+            const uint32_t r0) {
+            const uint32_t o_base = blockIdx.x * MUL_MAT_W4A8_OUT;
+            const uint32_t idx    = threadIdx.y * MUL_MAT_W4A8_BLOCK + threadIdx.x;
+
+            __shared__ int lut[256];
+            __shared__ int2 w_s[2][8][MUL_MAT_W4A8_OUT];
+            __shared__ int4 x_s[2][8][2 * MUL_MAT_W4A8_BLOCK];
+
+            const uint32_t w_words  = k / 8;
+            const uint32_t x_stride = k / 16;
+            const uint32_t groups   = k / 16;
+            const uint32_t stages   = (groups + 7) / 8;
+            const int* wi           = (const int*)w;
+            const int4* x4          = (const int4*)x;
+
+            if (idx == 0) {
+#pragma unroll
+                for (int b = 0; b < 256; ++b) {
+                    const int lo = ((b & 0xF) ^ 8) - 8;         // sign-extend the low nibble
+                    const int hi = (((b >> 4) & 0xF) ^ 8) - 8;  // sign-extend the high nibble
+                    lut[b]       = (lo & 0xFF) | ((hi & 0xFF) << 8);
+                }
+            }
+            if (idx < 128) {
+                const uint32_t g  = idx >> 5;
+                const uint32_t rl = idx & 31;
+                const uint32_t r  = r0 + rl;
+#pragma unroll
+                for (uint32_t h = 0; h < 2; ++h) {
+                    const uint32_t gi = g + 4 * h;
+                    x_s[0][gi][rl] =
+                        (r < rows && gi < groups) ? x4[(size_t)r * x_stride + gi] : make_int4(0, 0, 0, 0);
+                }
+            } else {
+                const uint32_t lin  = idx - 128;
+                const uint32_t col  = lin & (MUL_MAT_W4A8_OUT - 1);
+                const uint32_t g    = lin >> 6;
+                const uint32_t ocol = o_base + col;
+                const int2* wcol    = ocol < n ? (const int2*)(wi + (size_t)ocol * w_words) : nullptr;
+#pragma unroll
+                for (uint32_t h = 0; h < 4; ++h) {
+                    const uint32_t gi = g + 2 * h;
+                    // 0x88888888 expands through the LUT to zero, so groups
+                    // past the end of k contribute nothing.
+                    w_s[0][gi][col] = (wcol && gi < groups) ? wcol[gi] : make_int2(0x88888888, 0x88888888);
+                }
+            }
+            __syncthreads();
+
+            const uint32_t wv   = idx >> 6;
+            const uint32_t lane = idx & 63;
+            const uint32_t j    = lane & 15;
+            const uint32_t q    = lane >> 4;
+            const uint32_t ocol = o_base + wv * 16 + j;
+            const bool o_valid  = ocol < n;
+            const float wsc     = o_valid ? ws[ocol] : 0.0f;
+
+            int iacc[2][4]         = {};
+            const v4si32_w4a8 zero = {};
+
+            for (uint32_t s = 0; s < stages; ++s) {
+                const uint32_t buf = s & 1;
+                if (s + 1 < stages) {
+                    // prefetch the next stage into the other buffer
+                    if (idx < 128) {
+                        const uint32_t g  = idx >> 5;
+                        const uint32_t rl = idx & 31;
+                        const uint32_t r  = r0 + rl;
+#pragma unroll
+                        for (uint32_t h = 0; h < 2; ++h) {
+                            const uint32_t gi = (s + 1) * 8 + g + 4 * h;
+                            x_s[buf ^ 1][g + 4 * h][rl] =
+                                (r < rows && gi < groups) ? x4[(size_t)r * x_stride + gi] : make_int4(0, 0, 0, 0);
+                        }
+                    } else {
+                        const uint32_t lin  = idx - 128;
+                        const uint32_t col  = lin & (MUL_MAT_W4A8_OUT - 1);
+                        const uint32_t g    = lin >> 6;
+                        const uint32_t pcol = o_base + col;
+                        const int2* wcol    = pcol < n ? (const int2*)(wi + (size_t)pcol * w_words) : nullptr;
+#pragma unroll
+                        for (uint32_t h = 0; h < 4; ++h) {
+                            const uint32_t gi = (s + 1) * 8 + g + 2 * h;
+                            w_s[buf ^ 1][g + 2 * h][col] =
+                                (wcol && gi < groups) ? wcol[gi] : make_int2(0x88888888, 0x88888888);
+                        }
+                    }
+                }
+#pragma unroll
+                for (uint32_t gl = 0; gl < 8; ++gl) {
+                    const int2 w2     = w_s[buf][gl][wv * 16 + j];
+                    v4si32_w4a8 bfrag = {};
+                    if (o_valid) {
+                        bfrag = {
+                            (lut[w2.x & 0xFF] & 0xFFFF) | ((lut[(w2.x >> 8) & 0xFF] & 0xFFFF) << 16),
+                            (lut[(w2.x >> 16) & 0xFF] & 0xFFFF) | ((lut[(w2.x >> 24) & 0xFF] & 0xFFFF) << 16),
+                            (lut[w2.y & 0xFF] & 0xFFFF) | ((lut[(w2.y >> 8) & 0xFF] & 0xFFFF) << 16),
+                            (lut[(w2.y >> 16) & 0xFF] & 0xFFFF) | ((lut[(w2.y >> 24) & 0xFF] & 0xFFFF) << 16),
+                        };
+                    }
+#pragma unroll
+                    for (uint32_t tile = 0; tile < 2; ++tile) {
+                        const int4 a4           = x_s[buf][gl][tile * 16 + j];
+                        const v4si32_w4a8 afrag = {a4.x, a4.y, a4.z, a4.w};
+                        const v4si32_w4a8 dfrag =
+                            __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true, afrag, true, bfrag, zero, false);
+                        iacc[tile][0] += dfrag.x;
+                        iacc[tile][1] += dfrag.y;
+                        iacc[tile][2] += dfrag.z;
+                        iacc[tile][3] += dfrag.w;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (o_valid) {
+#pragma unroll
+                for (uint32_t tile = 0; tile < 2; ++tile) {
+#pragma unroll
+                    for (uint32_t d = 0; d < 4; ++d) {
+                        const uint32_t r = r0 + tile * 16 + 4 * d + q;
+                        if (r < rows) {
+                            // Multiply in the same order as the DP4A epilogue,
+                            // ((int * act) * ws). Left to itself the compiler
+                            // reassociates these multiplies, which changes the
+                            // rounding by 1 ulp and cascades through quantization.
+                            float value;
+                            asm("v_mul_f32 %0, %1, %2" : "=v"(value) : "v"((float)iacc[tile][d]), "v"(act_scales[r]));
+                            asm("v_mul_f32 %0, %1, %2" : "+v"(value) : "v"(wsc));
+                            if (bias != nullptr) {
+                                value += bias[ocol];
+                            }
+                            y[(size_t)r * n + ocol] = value;
+                        }
+                    }
+                }
+            }
+        }
+#endif  // SD_W4_WMMA_GFX11
+
+        static __global__ void __launch_bounds__(MUL_MAT_W4A8_BLOCK* MUL_MAT_W4A8_BLOCK) mul_mat_w4a4_convrot(
+            const char* __restrict__ w,
+            const char* __restrict__ x,
+            const float* __restrict__ ws,
+            const float* __restrict__ act_scales,
+            const float* __restrict__ bias,
+            float* __restrict__ y,
+            const uint32_t n,
+            const uint32_t rows,
+            const uint32_t k) {
+#if defined(SD_W4_WMMA_GFX11)
+            mul_mat_w4a4_convrot_wmma(w, x, ws, act_scales, bias, y, n, rows, k,
+                                      blockIdx.y * MUL_MAT_W4A8_ROWS);
+#else
+            mul_mat_w4a4_convrot_dp4a_impl(w, x, ws, act_scales, bias, y, n, rows, k / 2);
+#endif
+        }
 
         static __global__ void __launch_bounds__(MUL_MAT_W4A8_BLOCK* MUL_MAT_W4A8_BLOCK) mul_mat_w4a8_convrot(
             const char* __restrict__ w,
@@ -766,13 +968,151 @@ namespace SD_CUDA_NAMESPACE {
 #endif
         }
 
-        static __global__ void dequantize(const int32_t* accum, const float* xs, const float* ws, const float* bias, float* dst, int64_t n, int64_t total) {
-            const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-            if (i < total) {
-                float value = float(accum[i]) * xs[i / n] * ws[i % n];
-                dst[i]      = value + (bias ? bias[i % n] : 0.f);
-            }
+        // Signed-nibble weights dequantized into int8 bytes; low nibble is the
+        // even index. Used to feed the exact int32 hipBLASLt GEMM.
+        static __global__ void expand_w4_i8_cuda(const uint8_t* __restrict__ src, int8_t* __restrict__ dst, size_t bytes) {
+            const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= bytes)
+                return;
+            const uint8_t b = src[i];
+            dst[2 * i]      = (int8_t)(((b & 0xF) ^ 8) - 8);
+            dst[2 * i + 1]  = (int8_t)((((b >> 4) & 0xF) ^ 8) - 8);
         }
+
+        // Vectorized variant: one uint32 of packed nibbles becomes eight int8s
+        // stored as a single uint64. k % 64 == 0 keeps every count a multiple
+        // of four, so no scalar tail is needed. The nibble extraction is
+        // manually unrolled: a pragma-unrolled loop with a variable shift
+        // miscompiles under ROCm clang.
+        static __device__ __forceinline__ uint64_t expand_w4_pair(uint32_t byte) {
+            const uint32_t lo = byte & 0xF, hi = (byte >> 4) & 0xF;
+            return uint64_t(uint8_t(int((lo ^ 8) - 8))) | (uint64_t(uint8_t(int((hi ^ 8) - 8))) << 8);
+        }
+        static __global__ void expand_w4_i8_vec4_cuda(const uint32_t* __restrict__ src, uint64_t* __restrict__ dst, size_t quads) {
+            const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= quads)
+                return;
+            const uint32_t b = src[i];
+            dst[i]           = expand_w4_pair(b) | (expand_w4_pair(b >> 8) << 16) | (expand_w4_pair(b >> 16) << 32) |
+                     (expand_w4_pair(b >> 24) << 48);
+        }
+
+        // Same dequantization order as the DP4A epilogue, ((int * act) * ws).
+        // Each statement holds at most one multiply or add, so -ffast-math
+        // cannot reassociate or contract the sequence; the rounding matches
+        // the DP4A kernel and the int8 model's dequantize kernel alike.
+        static __global__ void dequant_w4_rows_vec4_cuda(
+            const int4* __restrict__ src,
+            const float* __restrict__ act_scales,
+            const float4* __restrict__ weight_scales,
+            const float4* __restrict__ bias,
+            float4* __restrict__ dst,
+            int64_t n4,
+            int64_t rows) {
+            const int64_t col = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            const int64_t row = blockIdx.y + int64_t(blockIdx.z) * 65535;
+            if (col >= n4 || row >= rows)
+                return;
+            const int64_t index = row * n4 + col;
+            const int4 v        = src[index];
+            const float act     = act_scales[row];
+            float4 value        = make_float4(v.x * act, v.y * act, v.z * act, v.w * act);
+            const float4 w      = weight_scales[col];
+            value.x *= w.x;
+            value.y *= w.y;
+            value.z *= w.z;
+            value.w *= w.w;
+            if (bias != nullptr) {
+                const float4 b = bias[col];
+                value.x += b.x;
+                value.y += b.y;
+                value.z += b.z;
+                value.w += b.w;
+            }
+            dst[index] = value;
+        }
+
+        static __global__ void dequant_w4_rows_cuda(
+            const int32_t* __restrict__ src,
+            const float* __restrict__ act_scales,
+            const float* __restrict__ weight_scales,
+            const float* __restrict__ bias,
+            float* __restrict__ dst,
+            int64_t n,
+            int64_t rows) {
+            const int64_t col = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            const int64_t row = blockIdx.y + int64_t(blockIdx.z) * 65535;
+            if (col >= n || row >= rows)
+                return;
+            float value = float(src[row * n + col]) * act_scales[row];
+            value *= weight_scales[col];
+            if (bias != nullptr) {
+                value += bias[col];
+            }
+            dst[row * n + col] = value;
+        }
+
+        // Runs the W4A4 product through the same int32 GEMM library call the
+        // int8 (sd.linear_i8) model uses: the caller dequantizes the packed
+        // nibble weights into workspace per call, then an exact int32 GEMM
+        // runs. Because the accumulation is exact and the dequantize kernels
+        // above keep the DP4A multiply order, the result is bit-identical to
+        // the WMMA/DP4A kernels.
+        // Returns false so the caller can fall back to the hand-written kernels.
+        static bool blas_w4a4_linear(
+            void* blas_handle,
+            const int8_t* w8,
+            const char* x,
+            const float* xs,
+            const float* ws,
+            const float* bias,
+            float* output,
+            int64_t n,
+            int64_t rows,
+            int64_t k,
+            char* scratch,
+            CUDAStream stream) {
+            const int64_t padded = (rows + 3) / 4 * 4;
+            auto* accum          = reinterpret_cast<int32_t*>(scratch);
+            const int32_t alpha = 1, beta = 0;
+#if defined(SD_CUDA_VENDOR_HIP)
+#if HIP_VERSION >= 60500000
+            constexpr auto compute_type = HIPBLAS_COMPUTE_32I;
+#else
+            constexpr auto compute_type = HIPBLAS_R_32I;
+#endif
+            const auto status = hipblasGemmEx(static_cast<hipblasHandle_t>(blas_handle), HIPBLAS_OP_T, HIPBLAS_OP_N,
+                                              int(n), int(padded), int(k), &alpha, w8, HIPBLAS_R_8I, int(k),
+                                              const_cast<int8_t*>(reinterpret_cast<const int8_t*>(x)), HIPBLAS_R_8I, int(k),
+                                              &beta, accum, HIPBLAS_R_32I, int(n), compute_type, HIPBLAS_GEMM_DEFAULT);
+            if (status != HIPBLAS_STATUS_SUCCESS)
+                return false;
+#else
+            const auto status = cublasGemmEx(static_cast<cublasHandle_t>(blas_handle), CUBLAS_OP_T, CUBLAS_OP_N,
+                                             int(n), int(padded), int(k), &alpha, w8, CUDA_R_8I, int(k),
+                                             const_cast<int8_t*>(reinterpret_cast<const int8_t*>(x)), CUDA_R_8I, int(k),
+                                             &beta, accum, CUDA_R_32I, int(n), CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (status != CUBLAS_STATUS_SUCCESS)
+                return false;
+#endif
+            const int64_t n4 = n / 4;
+            if (n4 > 0 && n % 4 == 0 &&
+                (reinterpret_cast<uintptr_t>(accum) | reinterpret_cast<uintptr_t>(output) | reinterpret_cast<uintptr_t>(ws) |
+                 reinterpret_cast<uintptr_t>(bias)) %
+                        16 ==
+                    0) {
+                const unsigned gy = unsigned(std::min<int64_t>(rows, 65535)), gz = unsigned((rows + 65534) / 65535);
+                dequant_w4_rows_vec4_cuda<<<dim3(unsigned((n + 1023) / 1024), gy, gz), 256, 0, stream>>>(
+                    reinterpret_cast<const int4*>(accum), xs, reinterpret_cast<const float4*>(ws),
+                    reinterpret_cast<const float4*>(bias), reinterpret_cast<float4*>(output), n4, rows);
+            } else {
+                const unsigned gy = unsigned(std::min<int64_t>(rows, 65535)), gz = unsigned((rows + 65534) / 65535);
+                dequant_w4_rows_cuda<<<dim3(unsigned((n + 255) / 256), gy, gz), 256, 0, stream>>>(
+                    accum, xs, ws, bias, output, n, rows);
+            }
+            return cuda_last_error() == cuda_success;
+        }
+
         static bool aligned(const ggml_tensor* t, size_t alignment) {
             if (!t)
                 return true;
@@ -782,6 +1122,10 @@ namespace SD_CUDA_NAMESPACE {
                 t = t->view_src;
             }
             return (reinterpret_cast<uintptr_t>(t->data) + offset) % alignment == 0;
+        }
+        static bool dp4a_forced() {
+            static const bool forced = [] { const char* v = std::getenv("GGML_CUDA_W4_FORCE_DP4A"); return v && std::atoi(v); }();
+            return forced;
         }
         static bool supports(ggml_backend_dev_t device, const ggml_tensor* node, void*) {
             SDW4Operation op;
@@ -797,8 +1141,11 @@ namespace SD_CUDA_NAMESPACE {
             return true;
         }
         struct Plan {
-            bool mma           = false;
-            size_t gemm_offset = 0;
+            bool mma             = false;
+            bool blas            = false;
+            size_t gemm_offset   = 0;
+            size_t accum_offset  = 0;
+            size_t expand_offset = 0;
 #ifdef SD_CUDA_W4_CUTLASS
             SDI8CudaGemmPlan* gemm = nullptr;
             ~Plan() { sd_cuda_i8_gemm_free(gemm); }
@@ -865,6 +1212,21 @@ namespace SD_CUDA_NAMESPACE {
             const size_t tensor_bytes = ggml_nbytes(dst) * ((op.kind == SDW4Kind::W4A4 && !plan->mma ? 1 : 0) + (may_alias ? 1 : 0));
             plan->gemm_offset         = (tensor_bytes + 255) / 256 * 256;
             *bytes                    = plan->gemm_offset + gemm_bytes;
+            if (op.kind == SDW4Kind::W4A4 && !plan->mma && !dp4a_forced()) {
+                // Workspace for the int32 GEMM library path: exact int32
+                // accumulators plus the per-call dequantized int8 weights.
+                // Expanded weights are recomputed each call: device-level
+                // allocations (hipMalloc) deadlock against queued kernels on
+                // this stack, and workspace memory does not survive between
+                // the per-step plan rebuilds.
+                const int64_t padded_rows = (ggml_nrows(dst) + 3) / 4 * 4;
+                const size_t accum_bytes  = ((size_t)padded_rows * dst->ne[0] * sizeof(int32_t) + 255) / 256 * 256;
+                const size_t expand_bytes = ((size_t)dst->ne[0] * op.input->ne[0] + 255) / 256 * 256;
+                plan->blas                = true;
+                plan->accum_offset        = plan->gemm_offset;
+                plan->expand_offset       = plan->accum_offset + accum_bytes;
+                *bytes                    = plan->expand_offset + expand_bytes;
+            }
             return GGML_STATUS_SUCCESS;
         }
         static bool overlaps(const ggml_tensor* dst, const ggml_tensor* src) {
@@ -892,8 +1254,8 @@ namespace SD_CUDA_NAMESPACE {
             const auto* ws   = static_cast<const float*>(op.weight_scale->data);
             const auto* bias = op.bias ? static_cast<const float*>(op.bias->data) : nullptr;
             const dim3 grid(unsigned((n + 63) / 64), unsigned((rows + 31) / 32)), block(16, 16);
-#ifdef SD_CUDA_W4_CUTLASS
             auto* plan = static_cast<Plan*>(state);
+#ifdef SD_CUDA_W4_CUTLASS
             if (plan->mma) {
                 if (plan->gemm) {
                     auto* workspace = scratch ? reinterpret_cast<char*>(scratch) + plan->gemm_offset : nullptr;
@@ -907,11 +1269,39 @@ namespace SD_CUDA_NAMESPACE {
             } else
 #endif
                 if (op.kind == SDW4Kind::W4A4) {
-                auto* accum = reinterpret_cast<int32_t*>(scratch + (alias ? ggml_nelements(dst) : 0));
-                mul_mat_w4a4_convrot_dp4a<<<grid, block, 0, stream>>>(w, x, accum, uint32_t(n), uint32_t(rows), uint32_t(k / 2));
+                if (!dp4a_forced() && plan->blas && scratch) {
+                    const auto reg        = ggml_backend_dev_backend_reg(ggml_backend_get_device(e->backend));
+                    const auto blas_query = reinterpret_cast<ggml_ext_gpu_blas_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_ext_gpu_blas_v1"));
+                    auto* handle          = blas_query ? blas_query(e->backend) : nullptr;
+                    if (handle) {
+                        const size_t packed_bytes = size_t(n) * size_t(k) / 2;
+                        auto* w8                  = reinterpret_cast<int8_t*>(reinterpret_cast<char*>(scratch) + plan->expand_offset);
+                        if ((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(w8)) % 8 == 0) {
+                            expand_w4_i8_vec4_cuda<<<unsigned((packed_bytes / 4 + 255) / 256), 256, 0, stream>>>(
+                                reinterpret_cast<const uint32_t*>(w), reinterpret_cast<uint64_t*>(w8), packed_bytes / 4);
+                        } else {
+                            expand_w4_i8_cuda<<<unsigned((packed_bytes + 255) / 256), 256, 0, stream>>>(
+                                reinterpret_cast<const uint8_t*>(w), w8, packed_bytes);
+                        }
+                        if (cuda_last_error() != cuda_success) {
+                            (void)cuda_last_error();
+                            w8 = nullptr;
+                        }
+                        if (w8 && blas_w4a4_linear(handle, w8, x, xs, ws, bias, output, n, rows, k,
+                                                   reinterpret_cast<char*>(scratch) + plan->accum_offset, stream))
+                            return GGML_STATUS_SUCCESS;
+                    }
+                    // Clear any pending error from the failed attempt, then
+                    // fall through to the hand-written kernels.
+                    (void)cuda_last_error();
+                }
+                if (dp4a_forced()) {
+                    mul_mat_w4a4_convrot_dp4a<<<grid, block, 0, stream>>>(w, x, ws, xs, bias, output, uint32_t(n), uint32_t(rows), uint32_t(k / 2));
+                } else {
+                    mul_mat_w4a4_convrot<<<grid, block, 0, stream>>>(w, x, ws, xs, bias, output, uint32_t(n), uint32_t(rows), uint32_t(k));
+                }
                 if (cuda_last_error() != cuda_success)
                     return GGML_STATUS_FAILED;
-                dequantize<<<unsigned((n * rows + 255) / 256), 256, 0, stream>>>(accum, xs, ws, bias, output, n, n * rows);
             } else {
                 mul_mat_w4a8_convrot<<<grid, block, 0, stream>>>(w, x, ws,
                                                                  static_cast<const float*>(op.s_channel->data), static_cast<const uint8_t*>(op.s_rel->data),
